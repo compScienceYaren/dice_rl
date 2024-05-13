@@ -318,6 +318,8 @@ class NeuralDice(object):
         reward_fn=self._reward_fn,
         weight_fn=weight_fn)
 
+    # tf.summary.scalar('current_step', tf.summary.experimental.get_step())
+
     tf.summary.scalar('nu_zero', nu_zero)
     tf.summary.scalar('lam', self._norm_regularizer * self._lam)
     tf.summary.scalar('dual_step', dual_step)

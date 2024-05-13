@@ -66,7 +66,7 @@ def get_onpolicy_dataset(load_dir, env_name, tabular_obs, max_trajectory_length,
   return dataset
 
 
-def add_episodes_to_dataset(episodes, valid_ids, write_dataset):
+def add_episodes_to_dataset(episodes, valid_ids, write_dataset: TFOffpolicyDataset):
   num_episodes = 1 if tf.rank(valid_ids) == 1 else tf.shape(valid_ids)[0]
   for ep_id in range(num_episodes):
     if tf.rank(valid_ids) == 1:
@@ -143,7 +143,7 @@ def main(argv):
   write_dataset.save(directory)
 
   print('Loading dataset.')
-  new_dataset = Dataset.load(directory)
+  new_dataset : TFOffpolicyDataset = Dataset.load(directory)
   print('num loaded steps', new_dataset.num_steps)
   print('num loaded total steps', new_dataset.num_total_steps)
   print('num loaded episodes', new_dataset.num_episodes)
@@ -155,7 +155,7 @@ def main(argv):
                                                  by_steps=False)
   print('per episode avg on saved and loaded offpolicy data', estimate)
 
-  print('Done!')
+  print('Dataset Generation DONE!')
 
 
 if __name__ == '__main__':

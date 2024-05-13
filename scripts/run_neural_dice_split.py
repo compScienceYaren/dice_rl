@@ -19,9 +19,9 @@ from __future__ import print_function
 from absl import app
 from absl import flags
 
+import keras
 import numpy as np
 import os
-import sys
 import tensorflow.compat.v2 as tf
 tf.compat.v1.enable_v2_behavior()
 import pickle
@@ -157,84 +157,160 @@ def main(argv):
 
   directory = os.path.join(load_dir, hparam_str)
   print('Loading dataset from', directory)
-  dataset : TFOffpolicyDataset = Dataset.load(directory)
-  all_steps = dataset.get_all_steps()
-  max_reward = tf.reduce_max(all_steps.reward)
-  min_reward = tf.reduce_min(all_steps.reward)
-  print('num loaded steps', dataset.num_steps)
-  print('num loaded total steps', dataset.num_total_steps)
-  print('num loaded episodes', dataset.num_episodes)
-  print('num loaded total episodes', dataset.num_total_episodes)
-  print('min reward', min_reward, 'max reward', max_reward)
-  print('behavior per-step',
-        estimator_lib.get_fullbatch_average(dataset, gamma=gamma))
-  target_dataset = Dataset.load(
-      directory.replace('alpha{}'.format(alpha), 'alpha1.0'))
-  print('target per-step',
-        estimator_lib.get_fullbatch_average(target_dataset, gamma=1.))
+  dataset: TFOffpolicyDataset = Dataset.load(directory)
 
-  activation_fn = tf.nn.relu
-  kernel_initializer = tf.keras.initializers.GlorotUniform()
-  hidden_dims = (64, 64)
-  input_spec = (dataset.spec.observation, dataset.spec.action)
-  nu_network = ValueNetwork(
-      input_spec,
-      fc_layer_params=hidden_dims,
-      activation_fn=activation_fn,
-      kernel_initializer=kernel_initializer,
-      last_kernel_initializer=kernel_initializer)
-  output_activation_fn = tf.math.square if zeta_pos else tf.identity
-  zeta_network = ValueNetwork(
-      input_spec,
-      fc_layer_params=hidden_dims,
-      activation_fn=activation_fn,
-      output_activation_fn=output_activation_fn,
-      kernel_initializer=kernel_initializer,
-      last_kernel_initializer=kernel_initializer)
+  dataset.get_data_table_contents("./table_contents_original.json")
 
-  nu_optimizer = tf.keras.optimizers.Adam(nu_learning_rate, clipvalue=1.0)
-  zeta_optimizer = tf.keras.optimizers.Adam(zeta_learning_rate, clipvalue=1.0)
-  lam_optimizer = tf.keras.optimizers.Adam(nu_learning_rate, clipvalue=1.0)
+  def split_dataset(train_ratio):
 
-  estimator = NeuralDice(
-      dataset.spec,
-      nu_network,
-      zeta_network,
-      nu_optimizer,
-      zeta_optimizer,
-      lam_optimizer,
-      gamma,
-      zero_reward=zero_reward,
-      f_exponent=f_exponent,
-      primal_form=primal_form,
-      reward_fn=reward_fn,
-      primal_regularizer=primal_regularizer,
-      dual_regularizer=dual_regularizer,
-      norm_regularizer=norm_regularizer,
-      nu_regularizer=nu_regularizer,
-      zeta_regularizer=zeta_regularizer)
+    if train_ratio is None:
+      train_ratio = 0.5
 
-  global_step = tf.Variable(0, dtype=tf.int64)
-  tf.summary.experimental.set_step(global_step)
+    # Calculate the number of samples for each subset
+    num_samples = (dataset.num_total_steps).numpy()
+    num_train_samples = int(train_ratio * num_samples)
+    # print(num_train_samples)
 
-  target_policy = get_target_policy(load_dir, env_name, tabular_obs)
-  running_losses = []
-  running_estimates = []
-  for step in range(num_steps): 
-    transitions_batch = dataset.get_step(batch_size, num_steps=2)
-    initial_steps_batch, _ = dataset.get_episode(batch_size, truncate_episode_at=1)
-    initial_steps_batch = tf.nest.map_structure(lambda t: t[:, 0, ...], initial_steps_batch)
-    losses = estimator.train_step(initial_steps_batch, 
-                                  transitions_batch,
-                                  target_policy)
-    running_losses.append(losses)
-    if step % 500 == 0 or step == num_steps - 1:
-      estimate = estimator.estimate_average_reward(dataset, target_policy)
-      running_estimates.append(estimate)
-      running_losses = []
-    global_step.assign_add(1)
+    # Split the dataset into training and evaluation subsets
+    train_dataset = TFOffpolicyDataset(
+        spec=dataset.spec,
+        capacity=num_train_samples,
+        name='TrainDataset',
+    )
+    eval_dataset = TFOffpolicyDataset(
+        spec=dataset.spec,
+        capacity=num_samples - num_train_samples,
+        name='EvalDataset',
+    )
 
-  print('Estimation DONE!')
+    env_table = dataset._data_table
+
+    # Transfer data from the full dataset to the subsets
+    for row in range(num_train_samples):
+        step = env_table.read(row)
+        train_dataset.add_step(step)
+    train_dataset.get_data_table_contents("./table_contents_train.json")
+    
+    for row in range(num_train_samples, num_samples):
+        step = env_table.read(row)
+        eval_dataset.add_step(step)
+    eval_dataset.get_data_table_contents("./table_contents_eval.json")
+    
+    return train_dataset, eval_dataset
+  
+
+  def run_cross_fitting(train_dataset : TFOffpolicyDataset, eval_dataset : TFOffpolicyDataset):
+    all_steps = train_dataset.get_all_steps()
+    max_reward = tf.reduce_max(all_steps.reward)
+    min_reward = tf.reduce_min(all_steps.reward)
+    print('num loaded steps', train_dataset.num_steps)
+    print('num loaded total steps', train_dataset.num_total_steps)
+    print('num loaded episodes', train_dataset.num_episodes)
+    print('num loaded total episodes', train_dataset.num_total_episodes)
+    print('min reward', min_reward, 'max reward', max_reward)
+    print('behavior per-step',
+          estimator_lib.get_fullbatch_average(train_dataset, gamma=gamma))
+    target_dataset = Dataset.load(
+        directory.replace('alpha{}'.format(alpha), 'alpha1.0'))
+    print('target per-step',
+          estimator_lib.get_fullbatch_average(target_dataset, gamma=1.))
+
+    activation_fn = tf.nn.relu
+    kernel_initializer = tf.keras.initializers.GlorotUniform()
+    hidden_dims = (64, 64)
+    input_spec = (train_dataset.spec.observation, train_dataset.spec.action)
+    nu_network = ValueNetwork(
+        input_spec,
+        fc_layer_params=hidden_dims,
+        activation_fn=activation_fn,
+        kernel_initializer=kernel_initializer,
+        last_kernel_initializer=kernel_initializer)
+    output_activation_fn = tf.math.square if zeta_pos else tf.identity
+    zeta_network = ValueNetwork(
+        input_spec,
+        fc_layer_params=hidden_dims,
+        activation_fn=activation_fn,
+        output_activation_fn=output_activation_fn,
+        kernel_initializer=kernel_initializer,
+        last_kernel_initializer=kernel_initializer)
+
+    nu_optimizer = tf.keras.optimizers.Adam(nu_learning_rate, clipvalue=1.0)
+    zeta_optimizer = tf.keras.optimizers.Adam(zeta_learning_rate, clipvalue=1.0)
+    lam_optimizer = tf.keras.optimizers.Adam(nu_learning_rate, clipvalue=1.0)
+
+    estimator = NeuralDice(
+        train_dataset.spec,
+        nu_network,
+        zeta_network,
+        nu_optimizer,
+        zeta_optimizer,
+        lam_optimizer,
+        gamma,
+        zero_reward=zero_reward,
+        f_exponent=f_exponent,
+        primal_form=primal_form,
+        reward_fn=reward_fn,
+        primal_regularizer=primal_regularizer,
+        dual_regularizer=dual_regularizer,
+        norm_regularizer=norm_regularizer,
+        nu_regularizer=nu_regularizer,
+        zeta_regularizer=zeta_regularizer)
+
+    global_step = tf.Variable(0, dtype=tf.int64)
+    tf.summary.experimental.set_step(global_step)
+
+    target_policy = get_target_policy(load_dir, env_name, tabular_obs)
+    running_losses = []
+    running_estimates = []
+
+    for step in range(num_steps): 
+      transitions_batch = train_dataset.get_step(batch_size, num_steps=2)
+      initial_steps_batch, _ = train_dataset.get_episode(batch_size, truncate_episode_at=1)
+      initial_steps_batch = tf.nest.map_structure(lambda t: t[:, 0, ...], initial_steps_batch)
+
+      losses = estimator.train_step(initial_steps_batch, transitions_batch, target_policy)
+      running_losses.append(losses)
+
+      if step % 500 == 0 or step == num_steps - 1:
+        estimate = estimator.estimate_average_reward(eval_dataset, target_policy)
+        running_estimates.append(estimate)
+        running_losses = []
+
+      global_step.assign_add(1)
+    
+    return running_losses, running_estimates
+  
+  
+
+  # currently implementing 2-fold cross-fitting
+  
+  train_dataset, eval_dataset = split_dataset(0.5)
+
+  k_fold = 2
+  final_estimates = []
+  current_estimates = []
+  for fold in range(k_fold):
+
+    # run the dice estimator for one fold
+    _, running_estimates = run_cross_fitting(train_dataset, eval_dataset)
+    print(f'Fold {fold}: Estimation DONE!')
+
+    # switch training dataset with evaluation dataset, and eval dataset with training dataset
+    temp = train_dataset
+    train_dataset = eval_dataset
+    eval_dataset = temp
+
+    current_estimates.append(running_estimates[len(running_estimates) - 1])
+
+    if (fold + 1) % 2 == 0:
+      joint_estimate = 0.5 * current_estimates[fold] + 0.5 * current_estimates[fold-1]
+      final_estimates.append(joint_estimate)
+      
+
+
+
+
+    
 
 
 if __name__ == '__main__':
