@@ -75,15 +75,29 @@ def get_sac_policy(tf_env):
   return policy
 
 
+# def load_policy(policy, env_name, load_dir, ckpt_file=None):
+#   policy = greedy_policy.GreedyPolicy(policy)
+#   checkpoint = tf.train.Checkpoint(policy=policy)
+#   if ckpt_file is None:
+#     checkpoint_filename = tf.train.latest_checkpoint(load_dir)
+#   else:
+#     checkpoint_filename = os.path.join(load_dir, ckpt_file)
+#   print('Loading policy from %s.' % checkpoint_filename)
+#   checkpoint.restore(checkpoint_filename).assert_existing_objects_matched()
+#   # Unwrap greedy wrapper.
+#   return policy.wrapped_policy
 def load_policy(policy, env_name, load_dir, ckpt_file=None):
   policy = greedy_policy.GreedyPolicy(policy)
   checkpoint = tf.train.Checkpoint(policy=policy)
   if ckpt_file is None:
     checkpoint_filename = tf.train.latest_checkpoint(load_dir)
+    checkpoint_filepath = checkpoint.save(file_prefix=os.path.join(load_dir, 'policy_checkpoint'))
+    # Save the latest checkpoint filename.
+    print('Latest checkpoint: %s' % checkpoint_filename)
   else:
-    checkpoint_filename = os.path.join(load_dir, ckpt_file)
-  print('Loading policy from %s.' % checkpoint_filename)
-  checkpoint.restore(checkpoint_filename).assert_existing_objects_matched()
+    checkpoint_filepath = os.path.join(load_dir, ckpt_file)
+  # print('Loading policy from %s.' % checkpoint_filename)
+  checkpoint.restore(checkpoint_filepath).assert_existing_objects_matched()
   # Unwrap greedy wrapper.
   return policy.wrapped_policy
 

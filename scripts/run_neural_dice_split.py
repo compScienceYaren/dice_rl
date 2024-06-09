@@ -18,10 +18,13 @@ from __future__ import print_function
 
 from absl import app
 from absl import flags
+from typing import Optional, Callable, Union, Tuple, List
 
 import keras
 import numpy as np
+import random
 import os
+import json
 import tensorflow.compat.v2 as tf
 tf.compat.v1.enable_v2_behavior()
 import pickle
@@ -81,6 +84,8 @@ flags.DEFINE_string(
     'transform_reward', None, 'Non-linear reward transformation'
     'One of [exp, cuberoot, None]')
 
+flags.DEFINE_integer('fold_number', 2, 'Number of folds for cross-fitting.')
+
 
 def main(argv):
   load_dir = FLAGS.load_dir
@@ -112,6 +117,8 @@ def main(argv):
   shift_reward = FLAGS.shift_reward
   transform_reward = FLAGS.transform_reward
 
+  fold_number = FLAGS.fold_number
+
   def reward_fn(env_step):
     reward = env_step.reward * scale_reward + shift_reward
     if transform_reward is None:
@@ -129,6 +136,13 @@ def main(argv):
                     ENV_NAME=env_name,
                     TAB=tabular_obs,
                     ALPHA=alpha,
+                    SEED=seed,
+                    NUM_TRAJ=num_trajectory,
+                    MAX_TRAJ=max_trajectory_length)
+  hparam_str_target = ('{ENV_NAME}_tabular{TAB}_alpha1.0_seed{SEED}_'
+                  'numtraj{NUM_TRAJ}_maxtraj{MAX_TRAJ}').format(
+                    ENV_NAME=env_name,
+                    TAB=tabular_obs,
                     SEED=seed,
                     NUM_TRAJ=num_trajectory,
                     MAX_TRAJ=max_trajectory_length)
@@ -158,67 +172,234 @@ def main(argv):
   directory = os.path.join(load_dir, hparam_str)
   print('Loading dataset from', directory)
   dataset: TFOffpolicyDataset = Dataset.load(directory)
+  # dataset.get_data_table_contents("./table_contents_original.json")
 
-  dataset.get_data_table_contents("./table_contents_original.json")
 
-  def split_dataset(train_ratio):
 
-    if train_ratio is None:
-      train_ratio = 0.5
+  def random_split(train_ratio, k_fold):
 
-    # Calculate the number of samples for each subset
     num_samples = (dataset.num_total_steps).numpy()
-    num_train_samples = int(train_ratio * num_samples)
-    # print(num_train_samples)
+    num_eval_samples = int(train_ratio * num_samples)
 
-    # Split the dataset into training and evaluation subsets
-    train_dataset = TFOffpolicyDataset(
-        spec=dataset.spec,
-        capacity=num_train_samples,
-        name='TrainDataset',
-    )
-    eval_dataset = TFOffpolicyDataset(
-        spec=dataset.spec,
-        capacity=num_samples - num_train_samples,
-        name='EvalDataset',
-    )
+    episodes, valid_steps = dataset.get_all_episodes_1_by_1()
+    combined = list(zip(episodes, valid_steps))
+    random.shuffle(combined)
+    all_episodes, all_valid_steps = zip(*combined)
 
-    env_table = dataset._data_table
+    folds = []
 
-    # Transfer data from the full dataset to the subsets
-    for row in range(num_train_samples):
-        step = env_table.read(row)
-        train_dataset.add_step(step)
-    train_dataset.get_data_table_contents("./table_contents_train.json")
-    
-    for row in range(num_train_samples, num_samples):
-        step = env_table.read(row)
-        eval_dataset.add_step(step)
-    eval_dataset.get_data_table_contents("./table_contents_eval.json")
-    
-    return train_dataset, eval_dataset
+    if k_fold == 2:
+
+      # Split the dataset into training and evaluation subsets
+      train_dataset = TFOffpolicyDataset(
+          spec=dataset.spec,
+          capacity=num_eval_samples,
+          name='TrainDataset',
+      )
+      eval_dataset = TFOffpolicyDataset(
+          spec=dataset.spec,
+          capacity=num_samples - num_eval_samples,
+          name='EvalDataset',
+      )
+
+      split_index = len(all_episodes) // 2
+      train_episodes = all_episodes[:split_index]
+      train_valid_steps = all_valid_steps[:split_index]
+      eval_episodes = all_episodes[split_index:]
+      eval_valid_steps = all_valid_steps[split_index:]
+
+      for i, (episode, valid_steps) in enumerate(zip(train_episodes, train_valid_steps)):
+        add_episodes_to_dataset(episode, valid_steps, train_dataset)
+      
+      for i, (episode, valid_steps) in enumerate(zip(eval_episodes, eval_valid_steps)):
+        add_episodes_to_dataset(episode, valid_steps, eval_dataset)
+
+      folds.append((train_dataset, eval_dataset))
+      folds.append((eval_dataset, train_dataset))
+
+      # train_dataset.get_data_table_contents("./table_contents_train.json")
+      # eval_dataset.get_data_table_contents("./table_contents_eval.json")
+
+    elif k_fold == 5: 
+
+      fold_size = len(all_episodes) // k_fold
+
+      for i in range(k_fold):
+          start = i * fold_size
+          end = (i + 1) * fold_size if i < k_fold - 1 else len(all_episodes)
+
+          eval_episodes = all_episodes[start:end]
+          eval_valid_steps = all_valid_steps[start:end]
+
+          train_episodes = all_episodes[:start] + all_episodes[end:]
+          train_valid_steps = all_valid_steps[:start] + all_valid_steps[end:]
+
+          train_dataset = TFOffpolicyDataset(
+              spec=dataset.spec,
+              capacity=num_samples-num_eval_samples,
+              name=f'TrainDataset_Fold{i + 1}',
+          )
+          eval_dataset = TFOffpolicyDataset(
+              spec=dataset.spec,
+              capacity=num_eval_samples,
+              name=f'EvalDataset_Fold{i + 1}',
+          )
+
+          for i, (episode, valid_steps) in enumerate(zip(train_episodes, train_valid_steps)):
+              add_episodes_to_dataset(episode, valid_steps, train_dataset)
+          
+          for i, (episode, valid_steps) in enumerate(zip(eval_episodes, eval_valid_steps)):
+              add_episodes_to_dataset(episode, valid_steps, eval_dataset)
+
+          folds.append((train_dataset, eval_dataset))
+
+    return folds
+
+
+  def add_episodes_to_dataset(episodes, valid_ids, write_dataset: TFOffpolicyDataset):
+    num_episodes = 1 if tf.rank(valid_ids) == 1 else tf.shape(valid_ids)[0]
+    for ep_id in range(num_episodes):
+      if tf.rank(valid_ids) == 1:
+        this_valid_ids = valid_ids
+        this_episode = episodes
+      else:
+        this_valid_ids = valid_ids[ep_id, ...]
+        this_episode = tf.nest.map_structure(
+            lambda t: t[ep_id, ...], episodes)
+
+      episode_length = tf.shape(this_valid_ids)[0]
+      for step_id in range(episode_length):
+        this_valid_id = this_valid_ids[step_id]
+        this_step = tf.nest.map_structure(
+            lambda t: t[step_id, ...], this_episode)
+        if this_valid_id:
+          write_dataset.add_step(this_step)
+
   
 
-  def run_cross_fitting(train_dataset : TFOffpolicyDataset, eval_dataset : TFOffpolicyDataset):
-    all_steps = train_dataset.get_all_steps()
-    max_reward = tf.reduce_max(all_steps.reward)
-    min_reward = tf.reduce_min(all_steps.reward)
-    print('num loaded steps', train_dataset.num_steps)
-    print('num loaded total steps', train_dataset.num_total_steps)
-    print('num loaded episodes', train_dataset.num_episodes)
-    print('num loaded total episodes', train_dataset.num_total_episodes)
-    print('min reward', min_reward, 'max reward', max_reward)
-    print('behavior per-step',
-          estimator_lib.get_fullbatch_average(train_dataset, gamma=gamma))
-    target_dataset = Dataset.load(
-        directory.replace('alpha{}'.format(alpha), 'alpha1.0'))
-    print('target per-step',
-          estimator_lib.get_fullbatch_average(target_dataset, gamma=1.))
+  def run_training_and_estimation(estimator : NeuralDice, 
+                                  train_dataset : TFOffpolicyDataset, 
+                                  eval_dataset : TFOffpolicyDataset,
+                                  ground_truth: float,
+                                  joint_estimates: Optional[List[float]] = None, 
+                                  k_fold: Optional[int] = None):
 
+    global_step = tf.Variable(0, dtype=tf.int64)
+    tf.summary.experimental.set_step(global_step)
+
+    target_policy = get_target_policy(load_dir, env_name, tabular_obs)
+    running_losses = []
+    running_estimates = []
+
+    for step in range(num_steps): 
+
+      transitions_batch = train_dataset.get_step(batch_size, num_steps=2)
+      initial_steps_batch, _ = train_dataset.get_episode(batch_size, truncate_episode_at=1)
+      initial_steps_batch = tf.nest.map_structure(lambda t: t[:, 0, ...], initial_steps_batch)
+
+      losses = estimator.train_step(initial_steps_batch, transitions_batch, target_policy)
+      running_losses.append(losses)
+
+      if step == num_steps - 1:
+        estimate = estimator.estimate_average_reward(eval_dataset, target_policy)
+        running_estimates.append(estimate)
+        joint_estimates = calculate_joint_estimate(running_estimates, joint_estimates, ground_truth, k_fold)
+        running_losses = []
+      elif step % 100 == 0:
+        estimate = estimator.estimate_average_reward(eval_dataset, target_policy)
+        running_estimates.append(estimate)
+        running_losses = []
+
+      global_step.assign_add(1)
+    
+    if k_fold is not None:
+      return joint_estimates
+  
+  
+  def run_cross_fitting():
+    
+    # if fold_number == 2:
+    #   train_ratio = 0.5
+    # elif fold_number == 5:
+    #   train_ratio = 0.2
+
+    train_ratio = float(1/fold_number)
+
+    folds_list = random_split(train_ratio, fold_number)
+
+    joint_estimates = []
+
+    target_directory = os.path.join(load_dir, hparam_str_target)
+    target_dataset: TFOffpolicyDataset = Dataset.load(target_directory)
+    ground_truth = estimator_lib.get_fullbatch_average(target_dataset)
+
+    for fold in range(fold_number):
+
+      train_dataset, eval_dataset = folds_list[fold]
+      estimator = build_estimator(train_dataset)
+
+      current_fold = fold+1
+      joint_estimates = run_training_and_estimation(estimator, 
+                                                    train_dataset, 
+                                                    eval_dataset, 
+                                                    ground_truth, 
+                                                    joint_estimates,
+                                                    current_fold)
+      
+      print(f'Fold {current_fold}: Estimation DONE!')
+  
+  
+  def calculate_joint_estimate(average_rewards: List[float], 
+                               joint_estimates: List[float],
+                               ground_truth: float, 
+                               fold_count):
+
+    joint_estimates.append(average_rewards)
+      
+    step_indices = list(range(len(average_rewards)))
+    step_indices = [index * 100 for index in step_indices]
+    # estimator_lib.plot_per_step_reward(step_indices, ground_truth, average_rewards, fold_count)
+
+    if fold_count == fold_number:
+
+      joint_estimate_array = np.array(joint_estimates)
+      final_mean = np.mean(joint_estimate_array, axis=0)
+      final_mean_list = final_mean.tolist()
+
+      if fold_number == 2:
+        filename = "./results/grid/log_fold2.json"
+      elif fold_number == 5:
+        filename = "./results/grid/log_fold5.json"
+      
+      # Convert EagerTensors to lists or other serializable types
+      step_indices_list = step_indices.tolist() if hasattr(step_indices, 'tolist') else step_indices
+      joint_estimates_list = [je.numpy().tolist() if hasattr(je, 'numpy') else je for je in final_mean_list]
+      ground_truth_list = ground_truth.numpy().tolist() if hasattr(ground_truth, 'numpy') else ground_truth
+
+      # Read existing data from the JSON file
+      if os.path.exists(filename):
+          with open(filename, 'r') as file:
+              data = json.load(file)
+      else:
+          data = {"steps": step_indices_list, "rewards_list": [], "ground_truth": []}
+      
+      # Append the new data
+      data["rewards_list"].append(joint_estimates_list)
+      data["ground_truth"].append(ground_truth_list)
+
+      # Write the updated data back to the file
+      with open(filename, 'w') as file:
+          json.dump(data, file, indent=4)
+
+    return joint_estimates
+  
+
+  
+  def build_estimator(dataset : TFOffpolicyDataset):
     activation_fn = tf.nn.relu
     kernel_initializer = tf.keras.initializers.GlorotUniform()
     hidden_dims = (64, 64)
-    input_spec = (train_dataset.spec.observation, train_dataset.spec.action)
+    input_spec = (dataset.spec.observation, dataset.spec.action)
     nu_network = ValueNetwork(
         input_spec,
         fc_layer_params=hidden_dims,
@@ -239,7 +420,7 @@ def main(argv):
     lam_optimizer = tf.keras.optimizers.Adam(nu_learning_rate, clipvalue=1.0)
 
     estimator = NeuralDice(
-        train_dataset.spec,
+        dataset.spec,
         nu_network,
         zeta_network,
         nu_optimizer,
@@ -255,62 +436,14 @@ def main(argv):
         norm_regularizer=norm_regularizer,
         nu_regularizer=nu_regularizer,
         zeta_regularizer=zeta_regularizer)
+  
+    return estimator  
 
-    global_step = tf.Variable(0, dtype=tf.int64)
-    tf.summary.experimental.set_step(global_step)
 
-    target_policy = get_target_policy(load_dir, env_name, tabular_obs)
-    running_losses = []
-    running_estimates = []
 
-    for step in range(num_steps): 
-      transitions_batch = train_dataset.get_step(batch_size, num_steps=2)
-      initial_steps_batch, _ = train_dataset.get_episode(batch_size, truncate_episode_at=1)
-      initial_steps_batch = tf.nest.map_structure(lambda t: t[:, 0, ...], initial_steps_batch)
-
-      losses = estimator.train_step(initial_steps_batch, transitions_batch, target_policy)
-      running_losses.append(losses)
-
-      if step % 500 == 0 or step == num_steps - 1:
-        estimate = estimator.estimate_average_reward(eval_dataset, target_policy)
-        running_estimates.append(estimate)
-        running_losses = []
-
-      global_step.assign_add(1)
-    
-    return running_losses, running_estimates
+  run_cross_fitting()
   
   
-
-  # currently implementing 2-fold cross-fitting
-  
-  train_dataset, eval_dataset = split_dataset(0.5)
-
-  k_fold = 2
-  final_estimates = []
-  current_estimates = []
-  for fold in range(k_fold):
-
-    # run the dice estimator for one fold
-    _, running_estimates = run_cross_fitting(train_dataset, eval_dataset)
-    print(f'Fold {fold}: Estimation DONE!')
-
-    # switch training dataset with evaluation dataset, and eval dataset with training dataset
-    temp = train_dataset
-    train_dataset = eval_dataset
-    eval_dataset = temp
-
-    current_estimates.append(running_estimates[len(running_estimates) - 1])
-
-    if (fold + 1) % 2 == 0:
-      joint_estimate = 0.5 * current_estimates[fold] + 0.5 * current_estimates[fold-1]
-      final_estimates.append(joint_estimate)
-      
-
-
-
-
-    
 
 
 if __name__ == '__main__':

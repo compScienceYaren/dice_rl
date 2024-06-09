@@ -21,7 +21,9 @@ from absl import flags
 
 import numpy as np
 import os
+import json
 import sys
+from typing import List
 import tensorflow.compat.v2 as tf
 tf.compat.v1.enable_v2_behavior()
 import pickle
@@ -80,6 +82,28 @@ flags.DEFINE_float('shift_reward', 0., 'Reward shift factor.')
 flags.DEFINE_string(
     'transform_reward', None, 'Non-linear reward transformation'
     'One of [exp, cuberoot, None]')
+
+def save_data(step_indices: List[float], rewards: List[float]):
+  
+    filename = "./results/grid/log_original.json"
+
+    # Convert EagerTensors to lists or other serializable types
+    step_indices_list = step_indices.tolist() if hasattr(step_indices, 'tolist') else step_indices
+    rewards_list = [r.numpy().tolist() if hasattr(r, 'numpy') else r for r in rewards]
+
+    # Read existing data from the JSON file
+    if os.path.exists(filename):
+        with open(filename, 'r') as file:
+            data = json.load(file)
+    else:
+        data = {"steps": step_indices_list, "rewards_list": []}
+    
+    # Append the new data
+    data["rewards_list"].append(rewards_list)
+
+    # Write the updated data back to the file
+    with open(filename, 'w') as file:
+        json.dump(data, file, indent=4)
 
 
 def main(argv):
@@ -228,11 +252,13 @@ def main(argv):
                                   transitions_batch,
                                   target_policy)
     running_losses.append(losses)
-    if step % 500 == 0 or step == num_steps - 1:
+    if step % 100 == 0 or step == num_steps - 1:
       estimate = estimator.estimate_average_reward(dataset, target_policy)
       running_estimates.append(estimate)
       running_losses = []
     global_step.assign_add(1)
+
+  save_data(list(range(len(running_estimates))), running_estimates)
 
   print('Estimation DONE!')
 
