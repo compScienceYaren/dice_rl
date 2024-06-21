@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+authors:
+- family-names: "Aslan"
+  given-names: "Yaren"
+title: "Use of sample-splitting and cross-fitting techniques to mitigate the risks of double dipping in behaviour-agnostic reinforcement learning"
+version: 2.0.4
+date-released: 09-06-2024
+url: "https://github.com/compScienceYaren/dice_rl"
