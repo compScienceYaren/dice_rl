@@ -85,7 +85,7 @@ flags.DEFINE_string(
 
 def save_data(step_indices: List[float], rewards: List[float]):
   
-    filename = "./results/grid/log_original.json"
+    filename = "./results/frozenlake/log_original.json"
 
     # Convert EagerTensors to lists or other serializable types
     step_indices_list = step_indices.tolist() if hasattr(step_indices, 'tolist') else step_indices

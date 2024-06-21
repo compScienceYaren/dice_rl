@@ -4,15 +4,15 @@ import os
 # load_dir = "./tests/testdata"
 # env_name = "reacher"
 
-# load_dir = "./tests/testdata"
-# env_name = "frozenlake"
+load_dir = "./tests/testdata"
+env_name = "frozenlake"
 
 # load_dir = "./tests/testdata"
 # load_dir_gen = "./tests/testdata/CartPole-v0"
 # env_name = "cartpole"
 
-load_dir = "./tests/testdata"
-env_name = "grid"
+# load_dir = "./tests/testdata"
+# env_name = "grid"
 
 def generate(): 
 
@@ -29,7 +29,7 @@ def generate():
         os.system(command)
 
 
-def run_split_and_basic_dice():
+def run_dice():
 
     commands_split2 = []
     commands_split5 = []
@@ -49,13 +49,13 @@ def run_split_and_basic_dice():
 
     # SplitDICE (sample splitting with 5-fold cross-fitting)
 
-    for seed in range(seed_limit):
+    for seed in range(2, seed_limit):
         commands_split5.append(f"python3 scripts/run_neural_dice_split.py --save_dir=./tests/testdata --load_dir=./tests/testdata --env_name={env_name} --num_trajectory={num_trajectory} --max_trajectory_length={max_trajectory_length} --alpha=0.0 --seed={seed} --tabular_obs=0 --num_steps={training_steps} --fold_number=5")
 
     for command in commands_split5:
         os.system(command)
 
-    # Basic DICE
+    # Naive DICE
 
     for seed in range(seed_limit):
         commands_original.append(f"python3 scripts/run_neural_dice.py --save_dir=./tests/testdata --load_dir=./tests/testdata --env_name={env_name} --num_trajectory={num_trajectory} --max_trajectory_length={max_trajectory_length} --alpha=0.0 --seed={seed} --tabular_obs=0 --num_steps={training_steps}")
@@ -64,7 +64,7 @@ def run_split_and_basic_dice():
         os.system(command)
 
 
-generate()
-# run_split_and_basic_dice()
+# generate()
+# run_dice()
 
 
